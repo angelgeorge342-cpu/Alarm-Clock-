@@ -40,9 +40,11 @@ int32_t Stacks[NUMTHREADS][STACKSIZE];
 // Outputs: none
 void OS_Init(void){
   DisableInterrupts();
-  BSP_Clock_InitFastest();// set processor clock to fastest speed
-  // initialize any global variables as needed
-  
+  BSP_Clock_InitFastest(); // set processor clock to fastest speed
+
+  Counter = 0;
+  PeriodicTask1  = 0;
+  PeriodicTask22 = 0;
 }
 
 void SetInitialStack(int i){
@@ -264,4 +266,6 @@ uint32_t OS_MailBox_Recv(void){ uint32_t theData;
   return theData;
 }
 	
+
+
 
