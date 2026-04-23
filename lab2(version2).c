@@ -52,6 +52,7 @@ volatile uint8_t       g_AlarmFiring  = 0;  // 1 = alarm currently ringing
 volatile uint8_t       g_BuzzerOn     = 0;  // 1 = buzzer should sound
 volatile uint8_t       g_DisplayDirty = 1;  // 1 = LCD needs refresh
 volatile uint32_t      g_SnoozeRemain = 0;  // seconds left in snooze
+volatile uint8_t g_LastStoppedByMovement = 0;  // 1 = last alarm auto-stopped by movement
 
 // Joystick values written by PeriodicTask2, read by JoystickTask
 volatile uint16_t      g_JoyX  = 512;    // 0-1023
@@ -293,8 +294,21 @@ void DisplayTask(void) {
 								// Seconds value (00–59)
 								snprintf(buf, sizeof(buf), "%02u", (unsigned)sc);
 								BSP_LCD_DrawString(9, 7, buf, LCD_GREEN);
-                break;
-            }
+                
+						
+								// Status line for last alarm cause
+								if (g_LastStoppedByMovement) {
+									BSP_LCD_DrawString(0, 8, "Last alarm: ", LCD_ORANGE);
+									BSP_LCD_DrawString(0, 9, "stopped with movement", LCD_ORANGE);
+							} else {
+								BSP_LCD_DrawString(0, 8, "                     ", LCD_BLACK);
+								BSP_LCD_DrawString(0, 9, "                     ", LCD_BLACK);
+							}
+
+								break;
+						}
+
+
 
             // ------------------------------------------------
             //  ALARM SET
@@ -682,67 +696,114 @@ void JoystickTask(void) {
 
 //  THREAD 3 — AlarmBuzzerTask
 //  Waits on g_SemaAlarm, drives buzzer, handles Stop/Snooze.
-
-void AlarmBuzzerTask(void) {
-    #define SNOOZE_SECS 300u    // 5 minutes
+	void AlarmBuzzerTask(void) {
+    #define SNOOZE_SECS 300u
     #define BEEP_ON_MS  400u
     #define BEEP_OFF_MS 400u
-	
+    #define MOVE_THRESHOLD 60  // movement sensitivity
+		// Simple unsigned absolute difference
+    #define ABS_DIFF(a,b) (( (a) > (b) ) ? ((a)-(b)) : ((b)-(a)))
+    uint16_t prevAx = 0, prevAy = 0, prevAz = 0;
+		
 
     while (1) {
-        // Block (spin) until alarm is signaled
+        // Wait until alarm is triggered
         OS_Wait(&g_SemaAlarm);
 
-        // Ensure screen/flags are set (also set by ClockTask/PeriodicTask1)
         g_Screen       = SCREEN_ALARM_FIRING;
         g_Cursor       = 0;
         g_AlarmFiring  = 1;
         g_BuzzerOn     = 1;
         g_DisplayDirty = 1;
+			 BSP_Accelerometer_Input(&prevAx, &prevAy, &prevAz);
+				
 
         bool handled = false;
+
         while (!handled) {
 
-            // --- Beep ON ---
-            BSP_Buzzer_Set(512);   // 50% duty => ~2048 Hz tone
+            // BEEP ON + LED ON 
+            BSP_Buzzer_Set(512);
+            BSP_RGB_Set(0, 0, 1023);   // BLUE LED ON
             SleepMs(BEEP_ON_MS);
 
-            // --- Beep OFF ---
+            // BEEP OFF + LED OFF 
             BSP_Buzzer_Set(0);
+            BSP_RGB_Set(0, 0, 0);      // LED OFF
             SleepMs(BEEP_OFF_MS);
+						
+					 // Allow DisplayTask to refresh alarm screen
+            g_DisplayDirty = 1;
+					
+            // MOVEMENT CHECK (accelerometer)
+            uint16_t ax, ay, az;
+            BSP_Accelerometer_Input(&ax, &ay, &az);
 
-            // --- Non-blocking check: did JoystickTask signal Stop? ---
-            if (g_SemaStop > 0) {
-                OS_Wait(&g_SemaStop);   // consume the token
+            if (ABS_DIFF(ax, prevAx) > MOVE_THRESHOLD ||
+                ABS_DIFF(ay, prevAy) > MOVE_THRESHOLD ||
+                ABS_DIFF(az, prevAz) > MOVE_THRESHOLD) {
 
+                // Auto-stop by movement
                 BSP_Buzzer_Set(0);
+                BSP_RGB_Set(0, 0, 0);
                 g_BuzzerOn     = 0;
                 g_AlarmFiring  = 0;
-                g_Screen       = SCREEN_HOME;
                 g_Cursor       = 0;
+
+                g_LastStoppedByMovement = 1;
+
+                BSP_LCD_FillScreen(LCD_BLACK);
+                BSP_LCD_DrawString(0, 0, "Alarm Stopped",      LCD_ORANGE);
+                BSP_LCD_DrawString(0, 1, "Movement Detected",  LCD_ORANGE );
+                SleepMs(1500);
+
+                g_Screen       = SCREEN_HOME;
+                g_DisplayDirty = 1;
+                handled        = true;
+                continue;
+            }
+
+           
+
+            // STOP (joystick Stop)
+            if (g_SemaStop > 0) {
+                OS_Wait(&g_SemaStop);
+
+                BSP_Buzzer_Set(0);
+                BSP_RGB_Set(0, 0, 0);
+                g_BuzzerOn     = 0;
+                g_AlarmFiring  = 0;
+                g_Cursor       = 0;
+
+                g_LastStoppedByMovement = 0;
+
+                g_Screen       = SCREEN_HOME;
                 g_DisplayDirty = 1;
                 handled        = true;
             }
 
-            // --- Non-blocking check: did JoystickTask signal Snooze? ---
+            // SNOOZE 
             if (!handled && g_SemaSnooze > 0) {
-                OS_Wait(&g_SemaSnooze); // consume the token
+                OS_Wait(&g_SemaSnooze);
 
                 BSP_Buzzer_Set(0);
+                BSP_RGB_Set(0, 0, 0);
                 g_BuzzerOn     = 0;
                 g_AlarmFiring  = 0;
+                g_Cursor       = 0;
+
+                g_LastStoppedByMovement = 0;
+
                 g_SnoozeRemain = SNOOZE_SECS;
                 g_Screen       = SCREEN_SNOOZE;
                 g_DisplayDirty = 1;
                 handled        = true;
-                // PeriodicTask1_1ms will decrement g_SnoozeRemain
-                // and re-signal g_SemaAlarm when it hits zero.
             }
         }
     }
 }
 
-//  main
+//Main
 int main(void) {
 
     // 1. Initialize RTOS (sets 80 MHz clock, disables interrupts)
@@ -760,9 +821,14 @@ int main(void) {
 
     // Buzzer: PF2 Timer1A PWM — initialize silent
     BSP_Buzzer_Init(0);
-
+		// RGB LED (start off)
+		BSP_RGB_Init(0, 0, 0);
+		//Accelerometer
+		BSP_Accelerometer_Init();
     // Temperature sensor on I2C (for future extension)
     BSP_TempSensor_Init();
+		
+
 
     // 3. Initialize semaphores (all start blocked = 0)
     OS_InitSemaphore(&g_SemaAlarm,  0);
